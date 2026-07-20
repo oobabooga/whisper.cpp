@@ -38,6 +38,18 @@ from pathlib import Path
 
 _C_ENV = {**os.environ, "LC_ALL": "C", "LANG": "C"}
 
+# Libraries the host provides at runtime, so an unresolved reference to them is
+# expected on a GPU-less build runner and is NOT a packaging defect: the NVIDIA
+# driver (libcuda), the CUDA runtime that package_bundle.py deliberately does not
+# bundle (paired with the user's PyTorch), and the Vulkan loader ICD. They resolve
+# on a real accelerator host. A genuinely missing BUNDLED lib (libggml*, libwhisper,
+# a co-located backend module) is not on this list and still fails the check.
+_HOST_PROVIDED_LIB = re.compile(
+    r"^lib(cuda|cudart|cublas(lt)?|cufft|curand|cusparse|cusolver|nvrtc(-builtins)?|"
+    r"nvjitlink|nvidia-[a-z0-9_.+-]+|vulkan)\.so",
+    re.I,
+)
+
 
 def _server_path(bundle: Path) -> Path:
     for name in ("whisper-server", "whisper-server.exe"):
@@ -86,17 +98,27 @@ def check_closure(bundle: Path, server: Path) -> None:
             sys.exit(f"ERROR: dyld could not resolve the bundle's libraries:\n{r.stderr[:2000]}")
         print("OK: dependency closure (dyld loaded the bundle cleanly)")
         return
-    # Linux: ldd every object, flag any "not found".
+    # Linux: ldd every object, flag any "not found" that is not a host-provided
+    # driver/runtime lib (GPU bundles resolve those on a real accelerator host).
     targets = [server] + sorted(list(bundle.glob("*.so")) + list(bundle.glob("*.so.*")))
     unresolved: list[str] = []
+    external: set[str] = set()
     for t in targets:
         r = subprocess.run(["ldd", str(t)], capture_output=True, text=True, env=env)
         for line in r.stdout.splitlines():
-            if "not found" in line:
+            if "not found" not in line:
+                continue
+            soname = line.strip().split()[0]
+            if _HOST_PROVIDED_LIB.match(soname):
+                external.add(soname)
+            else:
                 unresolved.append(f"{t.name}: {line.strip()}")
     if unresolved:
         sys.exit("ERROR: unresolved libraries in bundle:\n" + "\n".join(unresolved))
-    print(f"OK: dependency closure ({len(targets)} objects, no unresolved libs)")
+    if external:
+        print("NOTE: host-provided libs, resolved on a real accelerator host, "
+              "not bundled by design: " + ", ".join(sorted(external)))
+    print(f"OK: dependency closure ({len(targets)} objects, no unresolved bundled libs)")
 
 
 def _free_port() -> int:
