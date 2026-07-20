@@ -140,12 +140,14 @@ jobs:
 
   build-windows:
     name: windows/${{ matrix.arch }}
-    # x64 builds native; arm64 is cross-compiled on the same x64 runner via the
-    # MSVC amd64_arm64 cross toolchain (whisper's CPU recipe stays on MSVC, so no
-    # clang toolchain file is needed), so it cannot run/validate here -- only x64
-    # gets the transcription smoke test, mirroring unslothai/llama.cpp's
-    # windows-cpu arm64 leg. arm64 is best-effort until the recipe is proven: a
-    # failed leg is skipped (continue-on-error), never release-blocking.
+    # x64 builds native with MSVC. arm64 is cross-compiled on the same x64 runner:
+    # the MSVC amd64_arm64 env supplies the Windows arm64 SDK/libs, but the
+    # COMPILER is clang via whisper's own cmake/arm64-windows-llvm.cmake toolchain
+    # file (exactly how unslothai/llama.cpp builds windows-cpu arm64) -- MSVC's
+    # cl.exe cannot link ggml's aarch64 repack/GEMM kernels, clang can. arm64
+    # cannot run/validate on the x64 runner, so only x64 gets the transcription
+    # smoke test. arm64 stays best-effort (continue-on-error), never
+    # release-blocking.
     runs-on: windows-2022
     strategy:
       fail-fast: false
@@ -153,8 +155,10 @@ jobs:
         include:
           # x86-64: dynamic, runtime microarch dispatch (see header).
           - { arch: x64,   msvc_arch: amd64,       optional: false, shared: "ON",  cpu_defines: "-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON", static: "false" }
-          # arm64: cross-compiled, best-effort, single static binary.
-          - { arch: arm64, msvc_arch: amd64_arm64, optional: true,  shared: "OFF", cpu_defines: "",                                                 static: "true"  }
+          # arm64: cross-compiled with clang via the arm64-windows-llvm toolchain
+          # (MSVC cannot link ggml's aarch64 repack kernels); OpenMP off keeps the
+          # static binary self-contained. Best-effort, single static binary.
+          - { arch: arm64, msvc_arch: amd64_arm64, optional: true,  shared: "OFF", cpu_defines: "-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_OPENMP=OFF", static: "true"  }
     continue-on-error: ${{ matrix.optional }}
     defaults:
       run: { shell: pwsh }
