@@ -1,0 +1,63 @@
+# Throwaway smoke test. Do not merge.
+#
+# Downloads the Windows x64 CPU whisper-server prebuilt produced by
+# unslothai/whisper.cpp run 29745218552, verifies its sha256 against the value
+# that run's own "CPU / windows/x64" job printed at packaging time, then runs a
+# real transcription on a Windows runner via scripts/validate_bundle.py.
+#
+# A fork's GITHUB_TOKEN usually cannot read another repository's run artifacts,
+# so the exact artifact bytes are also committed at ci-payload/ as a fallback;
+# the sha256 pin makes both paths equivalent.
+
+name: Windows prebuilt smoke test (throwaway)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SRC_REPO: unslothai/whisper.cpp
+  SRC_RUN: "29745218552"
+  ARTIFACT: whisper-v1.9.1-unsloth.1-windows-x64-cpu
+  PIN_SHA256: 0d69bc16a877a5b4d4cdddc66c1d5bb02f2f2d18bdc01b56b97b43fbf7561137
+
+jobs:
+  test:
+    runs-on: windows-latest
+    defaults:
+      run: { shell: pwsh }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Try live artifact download from unslothai/whisper.cpp
+        id: live
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download $env:SRC_RUN --repo $env:SRC_REPO -n $env:ARTIFACT -D live
+          Move-Item "live/$env:ARTIFACT.zip" bundle.zip
+          echo "source=live artifact download"
+
+      - name: Fall back to committed artifact copy
+        if: steps.live.outcome == 'failure'
+        run: |
+          Copy-Item "ci-payload/$env:ARTIFACT.zip" bundle.zip
+          echo "source=committed copy (sha-pinned below)"
+
+      - name: Verify sha256 provenance pin
+        run: |
+          $h = (Get-FileHash bundle.zip -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:PIN_SHA256) { throw "sha256 mismatch: got $h, want $env:PIN_SHA256" }
+          echo "sha256 ok: $h"
+
+      - name: Extract bundle + fetch tiny model
+        run: |
+          Expand-Archive bundle.zip -DestinationPath bundle
+          Get-ChildItem bundle
+          curl.exe -fsSL -o ggml-tiny.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+
+      - name: Validate (help + transcription + --no-gpu)
+        run: python scripts/validate_bundle.py --bundle bundle --model ggml-tiny.en.bin --audio samples/jfk.wav
