@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth whisper prebuilt: CUDA"
+
+# Reusable child of unsloth-prebuilt.yml (P1). Per-profile Linux CUDA
+# whisper-server bundles (x64 + arm64) filtered into `matrix` by the parent. The
+# coverage-profile names mirror unslothai/llama.cpp (cuda12-legacy/older/newer/
+# portable, cuda13-older/newer/portable) so the Studio installer can pick a
+# whisper bundle from the same profile it already resolved for llama.cpp.
+#
+# GPU bundles are DYNAMIC and use GGML_BACKEND_DL: the CUDA backend ships as a
+# dlopen'd libggml-cuda.so module, so the binary still loads and runs on CPU
+# when no device / CUDA runtime is present (Studio appends --no-gpu during
+# training). The CUDA runtime (libcudart/libcublas) is intentionally NOT bundled
+# -- the installer pairs it with the user's PyTorch CUDA runtime.
+
+on:
+  workflow_call:
+    inputs:
+      tag:            { required: true,  type: string }
+      upstream_tag:   { required: true,  type: string }
+      repo:           { required: false, type: string, default: 'unslothai/whisper.cpp' }
+      commit:         { required: true,  type: string }
+      source_artifact: { required: true,  type: string }
+      matrix:         { required: true,  type: string }
+
+permissions:
+  contents: read
+
+env:
+  WHISPER_MODEL_URL: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}/${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with: { path: tooling }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@v6
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/whisper.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build
+
+      - name: Install ARM64 host compiler (gcc-14)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          sudo apt-get install -y gcc-14 g++-14
+          { echo "CC=gcc-14"; echo "CXX=g++-14"; echo "CUDAHOSTCXX=g++-14"; } >> "$GITHUB_ENV"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with: { key: "cuda-${{ matrix.cuda }}-${{ matrix.arch }}-${{ matrix.profile }}", variant: ccache, evict-old-files: 14d }
+
+      # Jimver has no CUDA 13.3 mapping, so pull that toolkit from the NVIDIA
+      # redist CDN by hand (same runner, so the glibc floor is unchanged).
+      - name: Install CUDA toolkit 13.3 (NVIDIA redist)
+        if: matrix.cuda == '13.3'
+        run: |
+          set -eux
+          case "${{ matrix.arch }}" in
+            x64)   PLAT=linux-x86_64 ;;
+            arm64) PLAT=linux-sbsa ;;
+            *) echo "unsupported arch" >&2; exit 1 ;;
+          esac
+          PREFIX="$HOME/cuda-13.3"; mkdir -p "$PREFIX"
+          BASE="https://developer.download.nvidia.com/compute/cuda/redist"
+          for cv in cuda_crt:13.3.33 cuda_cudart:13.3.29 cuda_nvcc:13.3.33 \
+                    cuda_nvrtc:13.3.33 libcublas:13.5.1.27 libnvvm:13.3.33 \
+                    cuda_nvtx:13.3.29 cuda_profiler_api:13.3.27 cccl:13.3.3.3.1; do
+            comp="${cv%:*}"; ver="${cv#*:}"; name="${comp}-${PLAT}-${ver}-archive"
+            curl -fsSL -o comp.tar.xz "$BASE/${comp}/${PLAT}/${name}.tar.xz"
+            tar -xf comp.tar.xz; cp -a "${name}/." "$PREFIX"/; rm -rf comp.tar.xz "${name}"
+          done
+          ln -sfn lib "$PREFIX/lib64"
+          { echo "CUDA_PATH=$PREFIX"; echo "CUDA_HOME=$PREFIX"; echo "LD_LIBRARY_PATH=$PREFIX/lib:${LD_LIBRARY_PATH:-}"; } >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
+        if: matrix.cuda != '13.3'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with: { cuda: "${{ matrix.cuda }}", method: network }
+
+      - name: Set up CUDA environment (Jimver)
+        if: matrix.cuda != '13.3'
+        run: |
+          echo "CUDA_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${{ steps.cuda-toolkit.outputs.CUDA_PATH }}/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Verify CUDA
+        run: nvcc --version
+
+      - name: Configure + build (dynamic, backend-DL, CPU fallback)
+        working-directory: src
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="$(echo '${{ matrix.archs }}' | tr ' ' ';')" \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release --target whisper-server -j 3
+          strip build/bin/whisper-server || true
+
+      - name: Package bundle
+        env:
+          OS: linux
+          ARCH: ${{ matrix.arch }}
+          ACCEL: ${{ matrix.profile }}
+          BACKEND: cuda
+          RUNTIME_LINE: ${{ matrix.line }}
+          COVERAGE_CLASS: ${{ matrix.klass }}
+          SMS: ${{ matrix.sms }}
+          MIN_OS: ${{ matrix.arch == 'arm64' && 'glibc-2.39' || 'glibc-2.35' }}
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+        run: python3 tooling/scripts/package_bundle.py
+
+      # GitHub-hosted CUDA runners have no GPU, so validate the mandatory CPU
+      # fallback (--no-gpu) + the closure here. Real GPU inference runs on a
+      # self-hosted accelerator runner (see README); x64 only (arm64 is native
+      # to this runner but the closure still checks libgcc-linked deps).
+      - name: Validate bundle (CPU fallback + closure)
+        if: matrix.arch == 'x64'
+        run: |
+          set -eux
+          mkdir -p bundle model
+          tar -xzf "dist/whisper-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz" -C bundle
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python3 tooling/scripts/validate_bundle.py --cpu-only \
+            --bundle bundle --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: whisper-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}
+          path: dist/whisper-${{ inputs.tag }}-linux-${{ matrix.arch }}-${{ matrix.profile }}.tar.gz
+          if-no-files-found: error

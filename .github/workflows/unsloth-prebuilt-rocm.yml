@@ -1,0 +1,332 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth whisper prebuilt: ROCm"
+
+# Reusable child of unsloth-prebuilt.yml (P1). Per-gfx-target ROCm whisper-server
+# bundles on Linux + Windows. The build mechanics (TheRock nightly ROCm download,
+# gfx target-name mapping, HIP/clang cmake invocation, runtime lib copy list,
+# patchelf $ORIGIN rpath) are adapted from lemonade-sdk/llamacpp-rocm and the
+# unslothai/llama.cpp ROCm child. Only whisper-server is built; the ROCm runtime
+# libraries and rocblas/hipblaslt kernel directories are co-located in the bundle
+# so it is self-contained. gfx families mirror unslothai/llama.cpp:
+#   gfx908, gfx90a, gfx103X, gfx110X, gfx1150, gfx1151, gfx120X
+#
+# NOTE ON THE HIP FLAG: current ggml uses -DGGML_HIP=ON (the old -DGGML_HIPBLAS
+# name is deprecated). This mirrors the working unslothai/llama.cpp ROCm build.
+
+on:
+  workflow_call:
+    inputs:
+      tag:            { required: true,  type: string }
+      upstream_tag:   { required: true,  type: string }
+      repo:           { required: false, type: string, default: 'unslothai/whisper.cpp' }
+      commit:         { required: true,  type: string }
+      source_artifact: { required: true,  type: string }
+      matrix:         { required: true,  type: string }
+      operating_systems: { required: false, type: string, default: 'windows,ubuntu' }
+      rocm_version:      { required: false, type: string, default: 'latest' }
+
+permissions:
+  contents: read
+
+env:
+  WHISPER_MODEL_URL: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+
+jobs:
+  build-ubuntu:
+    name: linux/${{ matrix.gfx_target }}
+    runs-on: ubuntu-22.04
+    if: contains(inputs.operating_systems, 'ubuntu')
+    strategy:
+      matrix: ${{ fromJson(inputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Free disk space
+        run: curl -fsSL https://raw.githubusercontent.com/kou/arrow/e49d8ae15583ceff03237571569099a6ad62be32/ci/scripts/util_free_space.sh | bash
+
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake ninja-build unzip curl patchelf
+
+      - name: Download + extract ROCm (TheRock nightly)
+        run: |
+          set -euo pipefail
+          current_target="${{ matrix.gfx_target }}"
+          s3_target="$current_target"
+          if [ "$current_target" = "gfx103X" ]; then s3_target="${current_target}-dgpu";
+          elif [ "$current_target" = "gfx110X" ] || [ "$current_target" = "gfx120X" ]; then s3_target="${current_target}-all"; fi
+          rocm_version="${{ inputs.rocm_version }}"
+          if [ "$rocm_version" = "latest" ]; then
+            s3=$(curl -s "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-linux-${s3_target}-7")
+            files=$(echo "$s3" | grep -oP '(?<=<Key>)[^<]*' | grep "therock-dist-linux-${s3_target}-")
+            latest_file=""; lm=0; ln=0; lp=0; lr=0; la=false
+            while IFS= read -r file; do
+              if [[ "$file" =~ therock-dist-linux-${s3_target}-.*?([0-9]+\.[0-9]+\.[0-9]+(a|rc)[0-9]+)\.tar\.gz ]]; then
+                v="${BASH_REMATCH[1]}"; M=$(echo "$v"|cut -d. -f1); N=$(echo "$v"|cut -d. -f2)
+                P=$(echo "$v"|cut -d. -f3|sed 's/\(a\|rc\).*//'); R=$(echo "$v"|sed 's/.*\(a\|rc\)//')
+                A=false; [[ "$v" =~ a ]] && A=true; newer=false
+                if [ "$M" -gt "$lm" ]; then newer=true
+                elif [ "$M" -eq "$lm" ] && [ "$N" -gt "$ln" ]; then newer=true
+                elif [ "$M" -eq "$lm" ] && [ "$N" -eq "$ln" ] && [ "$P" -gt "$lp" ]; then newer=true
+                elif [ "$M" -eq "$lm" ] && [ "$N" -eq "$ln" ] && [ "$P" -eq "$lp" ]; then
+                  if [ "$A" = true ] && [ "$la" = false ]; then newer=true
+                  elif [ "$A" = "$la" ] && [ "$R" -gt "$lr" ]; then newer=true; fi
+                fi
+                if [ "$newer" = true ]; then latest_file="$file"; lm="$M"; ln="$N"; lp="$P"; lr="$R"; la="$A"; fi
+              fi
+            done <<< "$files"
+            [ -n "$latest_file" ] || { echo "no ROCm nightly for $s3_target" >&2; exit 1; }
+            rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/$latest_file"
+          else
+            rocm_url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-linux-${s3_target}-${rocm_version}.tar.gz"
+          fi
+          sudo mkdir -p /opt/rocm
+          curl -sL "$rocm_url" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+
+      - name: Set ROCm environment
+        run: |
+          {
+            echo "HIP_PATH=/opt/rocm"; echo "ROCM_PATH=/opt/rocm"; echo "HIP_PLATFORM=amd"
+            echo "HIP_CLANG_PATH=/opt/rocm/llvm/bin"; echo "HIP_DEVICE_LIB_PATH=/opt/rocm/lib/llvm/amdgcn/bitcode"
+            echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib:${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+          echo "/opt/rocm/bin:/opt/rocm/llvm/bin:$PATH" >> "$GITHUB_PATH"
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@v6
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/whisper.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Build whisper-server + ROCm
+        run: |
+          set -eux
+          current_target="${{ matrix.gfx_target }}"
+          case "$current_target" in
+            gfx110X) mapped="gfx1100;gfx1101;gfx1102;gfx1103" ;;
+            gfx103X) mapped="gfx1030;gfx1031;gfx1032;gfx1034" ;;
+            gfx120X) mapped="gfx1200;gfx1201" ;;
+            *)       mapped="$current_target" ;;
+          esac
+          echo "MAPPED_TARGETS=$(echo "$mapped" | tr ';' ',')" >> "$GITHUB_ENV"
+          cd src && mkdir build && cd build
+          cmake .. -G Ninja \
+            -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++ \
+            -DCMAKE_CXX_FLAGS="-I/opt/rocm/include" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGPU_TARGETS="$mapped" \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_HIP=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DCMAKE_SYSTEM_NAME=Linux
+          cmake --build . --target whisper-server -j "$(nproc)"
+
+      - name: Copy ROCm runtime libs into build/bin
+        run: |
+          set -eu
+          bin="src/build/bin"
+          for d in rocblas hipblaslt; do
+            if [ -d "/opt/rocm/lib/$d/library" ]; then
+              mkdir -p "$bin/$d"; cp -r "/opt/rocm/lib/$d/library" "$bin/$d/"
+            fi
+          done
+          for lib in libhipblas librocblas libamdhip64 librocsolver libroctx64 libhipblaslt \
+                     librocprofiler-register libamd_comgr libamd_comgr_loader libhsa-runtime64 \
+                     librocroller librocm_kpack libLLVM libclang-cpp; do
+            cp -v /opt/rocm/lib/${lib}.so* "$bin/" 2>/dev/null || true
+          done
+          for s in liblzma numa z zstd elf drm drm_amdgpu bz2; do
+            cp -v /opt/rocm/lib/rocm_sysdeps/lib/librocm_sysdeps_${s}.so* "$bin/" 2>/dev/null || true
+          done
+          # libatomic.so.1 is a transitive dep of librocm_sysdeps_numa but is a
+          # system GCC runtime lib not shipped under /opt/rocm; bundle it.
+          sudo apt-get install -y libatomic1 >/dev/null 2>&1 || true
+          la="$(ldconfig -p | awk -F'=> ' '/libatomic\.so\.1/{print $2; exit}')"
+          cp -v "$la" "$bin/" 2>/dev/null || true
+          cd "$bin"
+          for f in *.so* whisper-server; do
+            [ -f "$f" ] && [ ! -L "$f" ] && patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+          done
+
+      - name: Package bundle
+        env:
+          OS: linux
+          ARCH: x64
+          ACCEL: rocm-${{ matrix.gfx_target }}
+          BACKEND: rocm
+          GFX_TARGET: ${{ matrix.gfx_target }}
+          MIN_OS: "glibc-2.35"
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+        run: python3 tooling/scripts/package_bundle.py
+
+      - name: Validate bundle (CPU fallback + closure)
+        run: |
+          set -eux
+          mkdir -p bundle model
+          tar -xzf "dist/whisper-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}.tar.gz" -C bundle
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python3 tooling/scripts/validate_bundle.py --cpu-only \
+            --bundle bundle --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: whisper-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}
+          path: dist/whisper-${{ inputs.tag }}-linux-x64-rocm-${{ matrix.gfx_target }}.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: windows/${{ matrix.gfx_target }}
+    runs-on: windows-latest
+    if: contains(inputs.operating_systems, 'windows')
+    strategy:
+      matrix: ${{ fromJson(inputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Install Ninja + Perl
+        run: |
+          choco install ninja strawberryperl -y --no-progress
+
+      - name: Download + extract ROCm (TheRock nightly)
+        shell: pwsh
+        run: |
+          function Invoke-DL($Uri,$Out,$Retries=5,$Delay=10){for($i=1;$i -le $Retries;$i++){try{Invoke-WebRequest -Uri $Uri -OutFile $Out -ErrorAction Stop;return}catch{if($i -eq $Retries){throw};Start-Sleep -Seconds ($Delay*$i)}}}
+          $t="${{ matrix.gfx_target }}"; $s3=$t
+          if($t -eq "gfx103X"){$s3="$t-dgpu"}elseif($t -eq "gfx110X" -or $t -eq "gfx120X"){$s3="$t-all"}
+          $ver="${{ inputs.rocm_version }}"
+          if($ver -eq "latest"){
+            $r=(Invoke-WebRequest "https://therock-nightly-tarball.s3.amazonaws.com/?prefix=therock-dist-windows-$s3-7").Content
+            $files=$r -split '<Key>' | Where-Object {$_ -match '</Key>'} | ForEach-Object { ($_ -split '</Key>')[0] }
+            $vf=@(); foreach($f in $files){ if($f -match "therock-dist-windows-$s3-.*?(\d+\.\d+\.\d+(?:a|rc)\d+)\.tar\.gz"){ $v=$matches[1]; $vf+=[PSCustomObject]@{File=$f;Major=[int]($v -split '\.')[0];Minor=[int]($v -split '\.')[1];Patch=[int](($v -split '\.')[2] -replace '(?:a|rc).*','');RC=[int]($v -replace '.*(?:a|rc)','');IsAlpha=$v -match 'a'} } }
+            $latest=($vf | Sort-Object Major,Minor,Patch,@{Expression={if($_.IsAlpha){1}else{0}}},RC | Select-Object -Last 1).File
+            $url="https://therock-nightly-tarball.s3.amazonaws.com/$latest"
+          } else { $url="https://therock-nightly-tarball.s3.amazonaws.com/therock-dist-windows-$s3-$ver.tar.gz" }
+          Invoke-DL $url "rocm.tar.gz"
+          New-Item -ItemType Directory -Force -Path "C:\opt\rocm" | Out-Null
+          tar -xzf rocm.tar.gz -C C:\opt\rocm --strip-components=1
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@v6
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/whisper.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Build whisper-server + ROCm
+        shell: cmd
+        run: |
+          set "current_target=${{ matrix.gfx_target }}"
+          if "%current_target%"=="gfx110X" ( set "mapped=gfx1100;gfx1101;gfx1102;gfx1103"
+          ) else if "%current_target%"=="gfx103X" ( set "mapped=gfx1030;gfx1031;gfx1032;gfx1034"
+          ) else if "%current_target%"=="gfx120X" ( set "mapped=gfx1200;gfx1201"
+          ) else ( set "mapped=%current_target%" )
+          set HIP_PATH=C:\opt\rocm
+          set HIP_PLATFORM=amd
+          set PATH=%HIP_PATH%\lib\llvm\bin;%HIP_PATH%\bin;C:\ninja;%PATH%
+          call "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath > vs_path.txt
+          set /p VS_PATH=<vs_path.txt
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+          cd src
+          mkdir build && cd build
+          cmake .. -G Ninja ^
+            -DCMAKE_C_COMPILER="C:\opt\rocm\lib\llvm\bin\clang.exe" ^
+            -DCMAKE_CXX_COMPILER="C:\opt\rocm\lib\llvm\bin\clang++.exe" ^
+            -DCMAKE_CXX_FLAGS="-IC:\opt\rocm\include" ^
+            -DCMAKE_CROSSCOMPILING=ON ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGPU_TARGETS="%mapped%" ^
+            -DBUILD_SHARED_LIBS=ON ^
+            -DGGML_HIP=ON ^
+            -DGGML_OPENMP=OFF ^
+            -DGGML_NATIVE=OFF ^
+            -DWHISPER_BUILD_EXAMPLES=ON ^
+            -DWHISPER_BUILD_SERVER=ON ^
+            -DWHISPER_BUILD_TESTS=OFF ^
+            -DWHISPER_SDL2=OFF ^
+            -DCMAKE_SYSTEM_NAME=Windows
+          cmake --build . --target whisper-server -j %NUMBER_OF_PROCESSORS%
+
+      - name: Copy ROCm runtime DLLs into build/bin
+        shell: pwsh
+        run: |
+          $bin="src\build\bin"; $rb="C:\opt\rocm\bin"
+          foreach($p in @("amdhip64_*.dll","rocm_kpack.dll","amd_comgr*.dll","libhipblas.dll","rocblas.dll","rocsolver.dll","hipblaslt.dll","libhipblaslt.dll","hipblas.dll")){
+            Get-ChildItem -Path $rb -Name $p -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item (Join-Path $rb $_) (Join-Path $bin $_) }
+          }
+          foreach($d in @("rocblas\library","hipblaslt\library")){
+            if(Test-Path (Join-Path $rb $d)){ New-Item -ItemType Directory -Force -Path (Join-Path $bin $d) | Out-Null; Copy-Item (Join-Path $rb $d) (Split-Path (Join-Path $bin $d)) -Recurse -Force }
+          }
+
+      - name: Set mapped targets output (for manifest)
+        shell: bash
+        run: |
+          case "${{ matrix.gfx_target }}" in
+            gfx110X) m="gfx1100,gfx1101,gfx1102,gfx1103" ;;
+            gfx103X) m="gfx1030,gfx1031,gfx1032,gfx1034" ;;
+            gfx120X) m="gfx1200,gfx1201" ;;
+            *)       m="${{ matrix.gfx_target }}" ;;
+          esac
+          echo "MAPPED_TARGETS=$m" >> "$GITHUB_ENV"
+
+      - name: Package bundle
+        shell: bash
+        env:
+          OS: windows
+          ARCH: x64
+          ACCEL: rocm-${{ matrix.gfx_target }}
+          BACKEND: rocm
+          GFX_TARGET: ${{ matrix.gfx_target }}
+          MIN_OS: "windows-10"
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+        run: python tooling/scripts/package_bundle.py
+
+      - name: Validate bundle (CPU fallback)
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p bundle model
+          (cd bundle && 7z x -y "../dist/whisper-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip" >/dev/null)
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python tooling/scripts/validate_bundle.py --cpu-only \
+            --bundle bundle --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: whisper-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}
+          path: dist/whisper-${{ inputs.tag }}-windows-x64-rocm-${{ matrix.gfx_target }}.zip
+          if-no-files-found: error

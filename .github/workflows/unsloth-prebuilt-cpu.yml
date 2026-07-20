@@ -1,0 +1,223 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth whisper prebuilt: CPU"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the P0 CPU whisper-server
+# bundles: Linux x64, Linux arm64, Windows x64/arm64. (The macOS x64 CPU slice
+# is built by the macOS child so it shares the deployment-target logic.)
+#
+# CPU bundles are STATIC (-DBUILD_SHARED_LIBS=OFF): whisper-server links
+# libwhisper/libggml into one self-contained binary, so it is a single-file
+# drop-in that needs no loader changes. GGML_NATIVE=OFF keeps the CPU dispatch
+# portable across microarchitectures. Only the whisper-server target is built
+# (examples on so the server compiles, tests off).
+
+on:
+  workflow_call:
+    inputs:
+      tag:            { required: true,  type: string }
+      upstream_tag:   { required: true,  type: string }
+      repo:           { required: false, type: string, default: 'unslothai/whisper.cpp' }
+      commit:         { required: true,  type: string }
+      source_artifact: { required: true,  type: string }
+
+permissions:
+  contents: read
+
+env:
+  # Tiny English model + the repo's own JFK sample drive the CI transcription.
+  WHISPER_MODEL_URL: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+
+jobs:
+  build-linux:
+    name: linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@v6
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/whisper.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y build-essential ninja-build
+
+      # arm64 on ubuntu-22.04-arm keeps the glibc 2.35 floor; jammy gcc can't
+      # target armv9 SME, so use clang (links the system libstdc++).
+      - name: Toolchain (clang 19 on arm64)
+        if: matrix.arch == 'arm64'
+        run: |
+          set -eux
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 19
+          { echo "CC=clang-19"; echo "CXX=clang++-19"; } >> "$GITHUB_ENV"
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with: { key: "cpu-linux-${{ matrix.arch }}", variant: ccache, evict-old-files: 14d }
+
+      - name: Configure + build (static, portable CPU dispatch)
+        working-directory: src
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release --target whisper-server -j "$(nproc)"
+          strip build/bin/whisper-server || true
+
+      - name: Package bundle
+        env:
+          OS: linux
+          ARCH: ${{ matrix.arch }}
+          ACCEL: cpu
+          BACKEND: cpu
+          STATIC: "true"
+          MIN_OS: "glibc-2.35"
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+        run: python3 tooling/scripts/package_bundle.py
+
+      # Native runners (x64 + arm64 are both native here), so validate for real.
+      - name: Validate bundle (help + closure + transcription + --no-gpu)
+        run: |
+          set -eux
+          mkdir -p bundle model
+          tar -xzf "dist/whisper-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu.tar.gz" -C bundle
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python3 tooling/scripts/validate_bundle.py \
+            --bundle bundle --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: whisper-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu
+          path: dist/whisper-${{ inputs.tag }}-linux-${{ matrix.arch }}-cpu.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: windows/${{ matrix.arch }}
+    # x64 builds native; arm64 is cross-compiled on the same x64 runner via the
+    # MSVC amd64_arm64 cross toolchain (whisper's CPU recipe stays on MSVC, so no
+    # clang toolchain file is needed), so it cannot run/validate here -- only x64
+    # gets the transcription smoke test, mirroring unslothai/llama.cpp's
+    # windows-cpu arm64 leg. arm64 is best-effort until the recipe is proven: a
+    # failed leg is skipped (continue-on-error), never release-blocking.
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   msvc_arch: amd64,       optional: false }
+          - { arch: arm64, msvc_arch: amd64_arm64, optional: true  }
+    continue-on-error: ${{ matrix.optional }}
+    defaults:
+      run: { shell: pwsh }
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@v6
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/whisper.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with: { key: "cpu-windows-${{ matrix.arch }}", variant: ccache, evict-old-files: 14d }
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      # amd64 for x64; amd64_arm64 cross-compiles arm64 from the x64 host.
+      - name: Setup MSVC (${{ matrix.msvc_arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with: { arch: "${{ matrix.msvc_arch }}" }
+
+      - name: Configure + build (static, portable CPU dispatch)
+        working-directory: src
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DGGML_NATIVE=OFF `
+            -DWHISPER_BUILD_EXAMPLES=ON `
+            -DWHISPER_BUILD_SERVER=ON `
+            -DWHISPER_BUILD_TESTS=OFF `
+            -DWHISPER_SDL2=OFF `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release --target whisper-server
+
+      - name: Package bundle
+        env:
+          OS: windows
+          ARCH: ${{ matrix.arch }}
+          ACCEL: cpu
+          BACKEND: cpu
+          STATIC: "true"
+          MIN_OS: "windows-10"
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+        run: python tooling/scripts/package_bundle.py
+
+      # arm64 is cross-compiled and cannot execute on the x64 runner; validate
+      # the native x64 bundle only. The arm64 zip still ships (packaged above).
+      - name: Validate bundle (help + transcription + --no-gpu)
+        if: matrix.arch == 'x64'
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p bundle model
+          (cd bundle && 7z x -y "../dist/whisper-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip" >/dev/null)
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python tooling/scripts/validate_bundle.py \
+            --bundle bundle --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: whisper-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu
+          path: dist/whisper-${{ inputs.tag }}-windows-${{ matrix.arch }}-cpu.zip
+          if-no-files-found: error

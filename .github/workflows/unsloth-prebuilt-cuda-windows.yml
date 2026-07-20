@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth whisper prebuilt: CUDA Windows"
+
+# Reusable child of unsloth-prebuilt.yml (P1). Per-profile Windows x64 CUDA
+# whisper-server bundles filtered into `matrix` by the parent. Mirrors the Linux
+# CUDA child on the MSVC + Ninja toolchain: dynamic build, GGML_BACKEND_DL so
+# the CUDA backend is a dlopen'd module (CPU fallback works with --no-gpu), no
+# RPATH (Windows loads sibling DLLs from the exe dir), .zip archive. CUDA
+# compiles in software here -- no GPU is present on the runner. The CUDA runtime
+# (cudart/cublas DLLs) is NOT bundled; the installer pairs it with the user's
+# PyTorch CUDA runtime.
+
+on:
+  workflow_call:
+    inputs:
+      tag:            { required: true,  type: string }
+      upstream_tag:   { required: true,  type: string }
+      repo:           { required: false, type: string, default: 'unslothai/whisper.cpp' }
+      commit:         { required: true,  type: string }
+      source_artifact: { required: true,  type: string }
+      matrix:         { required: true,  type: string }
+
+permissions:
+  contents: read
+
+env:
+  WHISPER_MODEL_URL: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+
+jobs:
+  build:
+    name: x64/${{ matrix.profile }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    defaults:
+      run: { shell: pwsh }
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with: { path: tooling }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@v6
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/whisper.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.20
+        with: { key: "cuda-${{ matrix.cuda }}-windows-${{ matrix.profile }}", variant: ccache, evict-old-files: 14d }
+
+      - uses: actions/setup-python@v6
+        with: { python-version: "3.11" }
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Jimver has no CUDA 13.3 mapping; assemble it from the NVIDIA redist
+      # component archives (block mirrors ggml-org's windows-setup-cuda).
+      - name: Install CUDA toolkit 13.3 (NVIDIA redist)
+        if: matrix.cuda == '13.3'
+        run: |
+          $dst = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          choco install unzip -y
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $comps = @(
+            "cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.3.33-archive.zip",
+            "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.3.29-archive.zip",
+            "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.3.33-archive.zip",
+            "cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.3.33-archive.zip",
+            "libcublas/windows-x86_64/libcublas-windows-x86_64-13.5.1.27-archive.zip",
+            "libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.3.33-archive.zip",
+            "cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.3.29-archive.zip",
+            "cuda_profiler_api/windows-x86_64/cuda_profiler_api-windows-x86_64-13.3.27-archive.zip",
+            "visual_studio_integration/windows-x86_64/visual_studio_integration-windows-x86_64-13.3.27-archive.zip",
+            "cccl/windows-x86_64/cccl-windows-x86_64-13.3.3.3.1-archive.zip"
+          )
+          foreach ($c in $comps) {
+            $fn = Split-Path $c -Leaf
+            curl.exe -fsSL -o $fn "$base/$c"
+            unzip -q $fn -d $dst
+            $sub = Join-Path $dst ($fn -replace '\.zip$','')
+            xcopy "$sub\*" "$dst" /E /I /H /Y | Out-Null
+          }
+          echo "$dst\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "CUDA_PATH=$dst" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install CUDA toolkit ${{ matrix.cuda }} (Jimver)
+        if: matrix.cuda != '13.3'
+        uses: Jimver/cuda-toolkit@v0.2.35
+        id: cuda-toolkit
+        with: { cuda: "${{ matrix.cuda }}", method: network }
+
+      - name: Set up CUDA environment (Jimver)
+        if: matrix.cuda != '13.3'
+        run: |
+          echo "CUDA_PATH=$env:CUDA_PATH" >> $env:GITHUB_ENV
+          echo "CUDA_HOME=$env:CUDA_PATH" >> $env:GITHUB_ENV
+
+      - name: Verify CUDA
+        run: nvcc --version
+
+      - name: Configure + build (dynamic, backend-DL, CPU fallback)
+        working-directory: src
+        run: |
+          $archs = "${{ matrix.archs }}".Replace(' ', ';')
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_CUDA=ON `
+            -DGGML_OPENMP=OFF `
+            -DWHISPER_BUILD_EXAMPLES=ON `
+            -DWHISPER_BUILD_SERVER=ON `
+            -DWHISPER_BUILD_TESTS=OFF `
+            -DWHISPER_SDL2=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES="$archs" `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          cmake --build build --config Release --target whisper-server -j 3
+
+      - name: Package bundle
+        env:
+          OS: windows
+          ARCH: x64
+          ACCEL: ${{ matrix.profile }}
+          BACKEND: cuda
+          RUNTIME_LINE: ${{ matrix.line }}
+          COVERAGE_CLASS: ${{ matrix.klass }}
+          SMS: ${{ matrix.sms }}
+          MIN_OS: "windows-10"
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+        run: python tooling/scripts/package_bundle.py
+
+      - name: Validate bundle (CPU fallback)
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p bundle model
+          (cd bundle && 7z x -y "../dist/whisper-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip" >/dev/null)
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python tooling/scripts/validate_bundle.py --cpu-only \
+            --bundle bundle --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: whisper-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}
+          path: dist/whisper-${{ inputs.tag }}-windows-x64-${{ matrix.profile }}.zip
+          if-no-files-found: error

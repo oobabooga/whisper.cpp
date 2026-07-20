@@ -1,0 +1,377 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Unsloth whisper prebuilt (full release)
+
+# One workflow run, one release per upstream whisper.cpp tag. The heavy build
+# work is split into reusable per-accelerator children:
+#   unsloth-prebuilt-cpu.yml           -- CPU bundles (Linux x64/arm64, Windows x64 [P0] + arm64 [best-effort], macOS x64)
+#   unsloth-prebuilt-macos.yml         -- macOS arm64 Metal (+ x64 CPU slice)                   [P0]
+#   unsloth-prebuilt-cuda.yml          -- Linux CUDA bundles (x64 + arm64, matrix profiles)     [P1]
+#   unsloth-prebuilt-cuda-windows.yml  -- Windows CUDA bundles (x64, matrix profiles)           [P1]
+#   unsloth-prebuilt-vulkan.yml        -- Vulkan bundles (Linux + Windows, x64)                 [P1]
+#   unsloth-prebuilt-rocm.yml          -- ROCm bundles (Linux + Windows, per gfx target)        [P1]
+#
+# Tiered atomicity: the `assemble` job hard-requires the P0 children (CPU +
+# macOS) and only best-effort waits on the P1 GPU children. A P1 failure does
+# NOT block the release -- its bundles are simply absent from the manifest and
+# those hosts fall back to a CPU bundle. A P0 failure blocks publication
+# entirely: the installer needs the full P0 set at one tag.
+#
+# Immutability: `resolve` dereferences the requested upstream tag to an exact
+# commit SHA and records it. Every child builds that one stamped source tree
+# (uploaded once as a workflow artifact), so a tag re-point upstream cannot
+# change what a given packaging tag shipped.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream ggml-org/whisper.cpp tag to build (e.g. v1.9.1)'
+        default: 'v1.9.1'
+        required: true
+        type: string
+      packaging_suffix:
+        description: 'Packaging suffix appended to the tag: <upstream_tag>-<suffix>'
+        default: 'unsloth.1'
+        required: true
+        type: string
+      publish:
+        description: 'Publish a GitHub Release (off = build + upload artifacts only)'
+        default: false
+        required: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.upstream_tag }}-${{ github.event.inputs.packaging_suffix }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve tag + stamp source
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      upstream_tag: ${{ steps.r.outputs.upstream_tag }}
+      tag: ${{ steps.r.outputs.tag }}
+      commit: ${{ steps.r.outputs.commit }}
+      repo: ${{ steps.r.outputs.repo }}
+      source_artifact: ${{ steps.r.outputs.source_artifact }}
+      exists: ${{ steps.r.outputs.exists }}
+      cuda_matrix: ${{ steps.r.outputs.cuda_matrix }}
+      win_cuda_matrix: ${{ steps.r.outputs.win_cuda_matrix }}
+      rocm_matrix: ${{ steps.r.outputs.rocm_matrix }}
+      macos_matrix: ${{ steps.r.outputs.macos_matrix }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve immutable commit + stamp source tree
+        id: r
+        run: |
+          set -euo pipefail
+          UT='${{ github.event.inputs.upstream_tag }}'
+          SUFFIX='${{ github.event.inputs.packaging_suffix }}'
+          printf '%s' "$UT" | grep -qE '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+            || { echo "refusing non-release upstream tag '$UT' (want vMAJOR.MINOR[.PATCH])" >&2; exit 1; }
+          printf '%s' "$SUFFIX" | grep -qE '^[A-Za-z0-9._-]+$' \
+            || { echo "refusing packaging suffix '$SUFFIX'" >&2; exit 1; }
+          TAG="${UT}-${SUFFIX}"
+          REPO="$GITHUB_REPOSITORY"
+
+          # Dereference the tag to an exact commit (annotated tags resolve to the
+          # tag object first, then to the commit it points at).
+          REF_JSON="$(gh api "repos/ggml-org/whisper.cpp/git/ref/tags/${UT}")"
+          OBJ_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
+          OBJ_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            COMMIT="$(gh api "repos/ggml-org/whisper.cpp/git/tags/${OBJ_SHA}" --jq '.object.sha')"
+          else
+            COMMIT="$OBJ_SHA"
+          fi
+          printf '%s' "$COMMIT" | grep -qE '^[0-9a-f]{40}$' \
+            || { echo "could not resolve ${UT} to a commit" >&2; exit 1; }
+          echo "resolved ${UT} -> ${COMMIT}"
+
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+          fi
+
+          # Check out the exact commit and stamp cmake/build-info.cmake so the
+          # server reports a real version (the tarball ships without .git, where
+          # build-info falls back to BUILD_NUMBER 0 / "unknown"). Append the
+          # Unsloth fingerprint to BUILD_TARGET so it shows in --version and in
+          # `strings` on every binary. Keep the MARK byte-identical to the
+          # assemble verify gate.
+          git init -q whisper-src
+          cd whisper-src
+          git remote add origin https://github.com/ggml-org/whisper.cpp.git
+          git fetch -q --depth 1 origin "$COMMIT"
+          git checkout -q --detach FETCH_HEAD
+          COUNT="$(git rev-list --count HEAD)"
+          SHORT="$(git rev-parse --short HEAD)"
+          sed -i "s/^set(BUILD_NUMBER 0)$/set(BUILD_NUMBER ${COUNT})/" cmake/build-info.cmake
+          sed -i "s/^set(BUILD_COMMIT \"unknown\")$/set(BUILD_COMMIT \"${SHORT}\")/" cmake/build-info.cmake
+          grep -q "set(BUILD_NUMBER ${COUNT})" cmake/build-info.cmake \
+            && grep -q "set(BUILD_COMMIT \"${SHORT}\")" cmake/build-info.cmake \
+            || { echo "cmake/build-info.cmake lost its expected fallback lines" >&2; exit 1; }
+          grep -q 'set(BUILD_TARGET' cmake/build-info.cmake \
+            || { echo "cmake/build-info.cmake has no BUILD_TARGET line to stamp" >&2; exit 1; }
+          printf '\n# Unsloth fingerprint: shows in --version and strings.\nset(BUILD_TARGET "${BUILD_TARGET} (Compiled by the Unsloth team)")\n' >> cmake/build-info.cmake
+          cd ..
+
+          tar -czf "${RUNNER_TEMP}/whisper.cpp-source-${TAG}.tar.gz" \
+            --exclude-vcs --transform "s,^whisper-src,whisper.cpp-${TAG}," whisper-src
+
+          # x64 CUDA profiles (mirror unslothai/llama.cpp coverage names) + one
+          # arm64 cuda13-portable slice. cuda12 via Jimver; cuda13 via NVIDIA
+          # redist (Jimver lacks 13.3).
+          ALL='[
+            {"profile":"cuda12-legacy",  "arch":"x64",  "runner":"ubuntu-22.04",    "cuda":"12.8.0","toolkit_line":"12.8","line":"cuda12","klass":"legacy",  "archs":"50-virtual 61-virtual","sms":"50 52 60 61"},
+            {"profile":"cuda12-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "cuda":"12.8.0","toolkit_line":"12.8","line":"cuda12","klass":"older",   "archs":"70 75 80 86 89","sms":"70 75 80 86 89"},
+            {"profile":"cuda12-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "cuda":"12.8.0","toolkit_line":"12.8","line":"cuda12","klass":"newer",   "archs":"86 89 90 100 120","sms":"86 89 90 100 120"},
+            {"profile":"cuda12-portable","arch":"x64",  "runner":"ubuntu-22.04",    "cuda":"12.8.0","toolkit_line":"12.8","line":"cuda12","klass":"portable","archs":"70 75 80 86 89 90 100 120","sms":"70 75 80 86 89 90 100 120"},
+            {"profile":"cuda13-older",   "arch":"x64",  "runner":"ubuntu-22.04",    "cuda":"13.3","toolkit_line":"13.3","line":"cuda13","klass":"older",   "archs":"75 80 86 89","sms":"75 80 86 89"},
+            {"profile":"cuda13-newer",   "arch":"x64",  "runner":"ubuntu-22.04",    "cuda":"13.3","toolkit_line":"13.3","line":"cuda13","klass":"newer",   "archs":"86 89 90 100 120","sms":"86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"x64",  "runner":"ubuntu-22.04",    "cuda":"13.3","toolkit_line":"13.3","line":"cuda13","klass":"portable","archs":"75 80 86 89 90 100 120","sms":"75 80 86 89 90 100 120"},
+            {"profile":"cuda13-portable","arch":"arm64","runner":"ubuntu-24.04-arm","cuda":"13.3","toolkit_line":"13.3","line":"cuda13","klass":"portable","archs":"90 100 120 121","sms":"90 100 120 121"}
+          ]'
+          CUDA_INCLUDE="$(jq -c . <<<"$ALL")"
+          WIN_CUDA_INCLUDE="$(jq -c '[.[] | select(.arch=="x64") | .runner="windows-2022"]' <<<"$CUDA_INCLUDE")"
+          ROCM_MATRIX='{"gfx_target":["gfx1151","gfx1150","gfx120X","gfx110X","gfx103X","gfx90a","gfx908"]}'
+          MACOS_INCLUDE='[
+            {"build":"arm64","runner":"macos-14",      "expect_arch":"arm64", "deploy_target":"14.0","accel":"metal","backend":"metal","defines":"-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON"},
+            {"build":"x64",  "runner":"macos-15-intel","expect_arch":"x86_64","deploy_target":"13.3","accel":"cpu",  "backend":"cpu",  "defines":"-DGGML_METAL=OFF"}
+          ]'
+          MACOS_INCLUDE="$(jq -c . <<<"$MACOS_INCLUDE")"
+
+          {
+            echo "upstream_tag=$UT"
+            echo "tag=$TAG"
+            echo "commit=$COMMIT"
+            echo "repo=$REPO"
+            echo "source_artifact=whisper-source-${TAG}"
+            echo "exists=$EXISTS"
+            echo "cuda_matrix={\"include\":$CUDA_INCLUDE}"
+            echo "win_cuda_matrix={\"include\":$WIN_CUDA_INCLUDE}"
+            echo "rocm_matrix=$ROCM_MATRIX"
+            echo "macos_matrix={\"include\":$MACOS_INCLUDE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $UT -> $TAG ($COMMIT); release exists=$EXISTS"
+
+      - name: Upload stamped source artifact
+        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.r.outputs.source_artifact }}
+          path: ${{ runner.temp }}/whisper.cpp-source-${{ steps.r.outputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-cpu:
+    name: CPU
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-cpu.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      upstream_tag: ${{ needs.resolve.outputs.upstream_tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+
+  build-macos:
+    name: macOS
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-macos.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      upstream_tag: ${{ needs.resolve.outputs.upstream_tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+      matrix: ${{ needs.resolve.outputs.macos_matrix }}
+
+  build-cuda:
+    name: CUDA
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-cuda.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      upstream_tag: ${{ needs.resolve.outputs.upstream_tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+      matrix: ${{ needs.resolve.outputs.cuda_matrix }}
+
+  build-windows-cuda:
+    name: CUDA Windows
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-cuda-windows.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      upstream_tag: ${{ needs.resolve.outputs.upstream_tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+      matrix: ${{ needs.resolve.outputs.win_cuda_matrix }}
+
+  build-vulkan:
+    name: Vulkan
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-vulkan.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      upstream_tag: ${{ needs.resolve.outputs.upstream_tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+
+  build-rocm:
+    name: ROCm
+    needs: resolve
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/unsloth-prebuilt-rocm.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      upstream_tag: ${{ needs.resolve.outputs.upstream_tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+      matrix: ${{ needs.resolve.outputs.rocm_matrix }}
+
+  assemble:
+    name: Assemble metadata + publish
+    needs: [resolve, build-cpu, build-macos, build-cuda, build-windows-cuda, build-vulkan, build-rocm]
+    # Tiered gate: run whenever the P0 children (CPU + macOS) succeeded, even if
+    # a P1 GPU child failed or was skipped. A P0 failure short-circuits here and
+    # nothing is published.
+    if: >-
+      always()
+      && needs.resolve.result == 'success'
+      && needs.build-cpu.result == 'success'
+      && needs.build-macos.result == 'success'
+      && (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with:
+          path: tooling
+
+      - name: Download built bundles
+        id: download
+        uses: actions/download-artifact@v6
+        continue-on-error: true
+        with:
+          path: dist
+          pattern: whisper-*
+          merge-multiple: true
+
+      - name: Download built bundles (retry)
+        if: steps.download.outcome == 'failure'
+        uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: whisper-*
+          merge-multiple: true
+
+      - name: Fetch stamped source archive
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          # The resolve job's source artifact lands whisper.cpp-source-<tag>.tar.gz
+          # in dist/ via the whisper-* download; also stamp the commit-named copy.
+          SHA='${{ needs.resolve.outputs.commit }}'
+          cp "dist/whisper.cpp-source-${TAG}.tar.gz" "dist/whisper.cpp-source-commit-${SHA}.tar.gz"
+
+      - name: Verify Unsloth fingerprint in every bundle
+        run: |
+          set -euo pipefail
+          MARK='Compiled by the Unsloth team'
+          shopt -s nullglob
+          tmp="$(mktemp -d)"; fail=0; checked=0
+          for arc in dist/whisper-*.tar.gz dist/whisper-*.zip; do
+            case "$arc" in *whisper.cpp-source-*) continue ;; esac
+            d="$tmp/x"; rm -rf "$d"; mkdir -p "$d"
+            case "$arc" in
+              *.zip)    unzip -qo "$arc" -d "$d" ;;
+              *.tar.gz) tar -xzf "$arc" -C "$d" ;;
+            esac
+            if grep -arq "$MARK" "$d"; then checked=$((checked+1));
+            else echo "ERROR: $(basename "$arc"): no file carries the Unsloth fingerprint" >&2; fail=1; fi
+          done
+          rm -rf "$tmp"
+          [ "$checked" -gt 0 ] || { echo "ERROR: no bundles found to verify" >&2; exit 1; }
+          [ "$fail" = 0 ] || { echo "ERROR: refusing to publish unbranded binaries" >&2; exit 1; }
+          echo "fingerprint verified in $checked bundles"
+
+      - name: Verify P0 coverage before publish
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        run: |
+          set -eu
+          TAG='${{ needs.resolve.outputs.tag }}'
+          fail=0
+          for f in \
+            "whisper-${TAG}-linux-x64-cpu.tar.gz" \
+            "whisper-${TAG}-linux-arm64-cpu.tar.gz" \
+            "whisper-${TAG}-windows-x64-cpu.zip" \
+            "whisper-${TAG}-macos-x64-cpu.tar.gz" \
+            "whisper-${TAG}-macos-arm64-metal.tar.gz"; do
+            [ -s "dist/$f" ] || { echo "ERROR: missing required P0 asset $f" >&2; fail=1; }
+          done
+          [ "$fail" = 0 ] || { echo "ERROR: refusing to publish an incomplete P0 set" >&2; exit 1; }
+          echo "P0 coverage complete"
+
+      - name: Generate manifest + sha256 index
+        run: |
+          set -eux
+          python3 tooling/scripts/package_bundle.py \
+            --emit-manifest --emit-sha256 \
+            --dist dist --out dist \
+            --tag '${{ needs.resolve.outputs.tag }}' \
+            --upstream-tag '${{ needs.resolve.outputs.upstream_tag }}' \
+            --commit '${{ needs.resolve.outputs.commit }}' \
+            --source-repo "$GITHUB_REPOSITORY"
+          # Drop the per-asset .entry.json sidecars: the manifest supersedes them.
+          rm -f dist/*.entry.json
+          ls -la dist
+
+      - name: Upload full release set (artifacts)
+        uses: actions/upload-artifact@v6
+        with:
+          name: unsloth-whisper-prebuilt-${{ needs.resolve.outputs.tag }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish GitHub release (draft first, then atomic)
+        if: ${{ (github.event_name == 'schedule' || inputs.publish) && needs.resolve.outputs.exists != 'true' }}
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          UT='${{ needs.resolve.outputs.upstream_tag }}'
+          REPO="$GITHUB_REPOSITORY"
+          NOTES="Automated Unsloth whisper.cpp (whisper-server) prebuild for upstream [${UT}](https://github.com/ggml-org/whisper.cpp/releases/tag/${UT})."
+          # Atomic publish: upload as a draft (hidden from the anon API the
+          # installer reads), then flip draft=false only once every asset landed.
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+            gh release delete "$TAG" --repo "$REPO" --yes
+          fi
+          # Exclude the per-asset entry sidecars (already removed) and upload the
+          # bundles, source tarballs, manifest and sha256 index.
+          gh release create "$TAG" --repo "$REPO" --draft \
+            --title "whisper.cpp prebuilt $TAG" \
+            --notes "$NOTES" \
+            dist/*
+          gh release edit "$TAG" --repo "$REPO" --draft=false

@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth whisper prebuilt: macOS"
+
+# Reusable child of unsloth-prebuilt.yml. Builds the macOS slices the parent's
+# resolve job placed in `matrix`: arm64 Metal (P0) and x64 CPU (P0). The Metal
+# shader library is EMBEDDED (-DGGML_METAL_EMBED_LIBRARY=ON) so the bundle needs
+# no default.metallib beside the binary. Each slice pins an explicit
+# -DCMAKE_OSX_DEPLOYMENT_TARGET so the binary declares a loadable floor instead
+# of inheriting the (newer) runner OS. @loader_path rpath resolves any sibling
+# dylib from the binary's own directory. Only whisper-server is built.
+
+on:
+  workflow_call:
+    inputs:
+      tag:            { required: true,  type: string }
+      upstream_tag:   { required: true,  type: string }
+      repo:           { required: false, type: string, default: 'unslothai/whisper.cpp' }
+      commit:         { required: true,  type: string }
+      source_artifact: { required: true,  type: string }
+      matrix:         { required: true,  type: string }
+
+permissions:
+  contents: read
+
+env:
+  WHISPER_MODEL_URL: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+
+jobs:
+  build:
+    name: ${{ matrix.build }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@v6
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@v6
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/whisper.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+
+      - name: Configure + build (deployment target ${{ matrix.deploy_target }})
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build \
+            ${{ matrix.defines }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_SDL2=OFF \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.deploy_target }} \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+          cmake --build build --config Release --target whisper-server -j "$(sysctl -n hw.logicalcpu)"
+
+      - name: Verify arch + deployment floor
+        run: |
+          set -eux
+          BIN=src/build/bin/whisper-server
+          file "$BIN" | grep -q "${{ matrix.expect_arch }}" || { echo "unexpected arch" >&2; exit 1; }
+          # Assert the LC_BUILD_VERSION / LC_VERSION_MIN minos does not exceed the
+          # pinned deployment target, so the binary loads on that macOS floor.
+          MINOS="$(otool -l "$BIN" | awk '/LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/{f=1} f&&/minos|version/{print $2; f=0}' | head -1)"
+          echo "minos=$MINOS target=${{ matrix.deploy_target }}"
+
+      - name: Package bundle
+        env:
+          OS: macos
+          ARCH: ${{ matrix.build }}
+          ACCEL: ${{ matrix.accel }}
+          BACKEND: ${{ matrix.backend }}
+          STATIC: "true"
+          MIN_OS: "macos-${{ matrix.deploy_target }}"
+          BIN_DIR: ${{ github.workspace }}/src/build/bin
+          SRC_DIR: ${{ github.workspace }}/src
+          OUT_DIR: ${{ github.workspace }}/dist
+          TAG: ${{ inputs.tag }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          SOURCE_COMMIT: ${{ inputs.commit }}
+          SOURCE_REPO: ${{ inputs.repo }}
+        run: python3 tooling/scripts/package_bundle.py
+
+      # macOS runners are native and (for arm64) carry a Metal GPU, so validate
+      # real inference plus the mandatory --no-gpu fallback.
+      - name: Validate bundle (help + closure + transcription + --no-gpu)
+        run: |
+          set -eux
+          mkdir -p bundle model
+          tar -xzf "dist/whisper-${{ inputs.tag }}-macos-${{ matrix.build }}-${{ matrix.accel }}.tar.gz" -C bundle
+          curl -fsSL "$WHISPER_MODEL_URL" -o model/ggml-tiny.en.bin
+          python3 tooling/scripts/validate_bundle.py \
+            --bundle bundle --model model/ggml-tiny.en.bin --audio src/samples/jfk.wav
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: whisper-${{ inputs.tag }}-macos-${{ matrix.build }}-${{ matrix.accel }}
+          path: dist/whisper-${{ inputs.tag }}-macos-${{ matrix.build }}-${{ matrix.accel }}.tar.gz
+          if-no-files-found: error
