@@ -206,6 +206,30 @@ jobs:
         run: |
           choco install ninja strawberryperl -y --no-progress
 
+      # Install the VS 2022 (17.x) MSVC toolchain. The windows-latest image ships
+      # VS 2026 (MSVC 14.51), whose STL marks math builtins like isgreater
+      # constexpr (implicitly __host__ __device__); that collides with ROCm
+      # clang's HIP __device__ forward declares and breaks the .hip compile
+      # (ggml-org/llama.cpp#22570). The build step below pins vcvars to the
+      # 17.x line via `vswhere -version "[17.0,18.0)"`, but that pin only
+      # resolves if a VS 2022 toolchain is actually present -- so install it
+      # here, exactly as unslothai/llama.cpp's ROCm/Windows job does.
+      - name: Install Visual Studio Build Tools (VS 2022 / MSVC 14.4x)
+        shell: pwsh
+        run: |
+          function Invoke-DL($Uri,$Out,$Retries=5,$Delay=10){for($i=1;$i -le $Retries;$i++){try{Invoke-WebRequest -Uri $Uri -OutFile $Out -ErrorAction Stop;return}catch{if($i -eq $Retries){throw};Start-Sleep -Seconds ($Delay*$i)}}}
+          $vsInstallerPath = "$env:TEMP\vs_buildtools.exe"
+          Write-Host "Downloading Visual Studio 2022 Build Tools..."
+          Invoke-DL "https://aka.ms/vs/17/release/vs_buildtools.exe" $vsInstallerPath
+          Write-Host "Installing Visual Studio 2022 Build Tools..."
+          Start-Process -FilePath $vsInstallerPath -ArgumentList `
+            "--quiet","--wait","--norestart", `
+            "--add","Microsoft.VisualStudio.Component.VC.Tools.x86.x64", `
+            "--add","Microsoft.VisualStudio.Component.VC.CMake.Project", `
+            "--add","Microsoft.VisualStudio.Component.VC.ATL", `
+            "--add","Microsoft.VisualStudio.Component.Windows11SDK.22621" -Wait
+          Remove-Item $vsInstallerPath -Force
+
       - name: Download + extract ROCm (TheRock nightly)
         shell: pwsh
         run: |
