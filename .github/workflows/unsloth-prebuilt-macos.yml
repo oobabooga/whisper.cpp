@@ -4,12 +4,18 @@
 name: "Unsloth whisper prebuilt: macOS"
 
 # Reusable child of unsloth-prebuilt.yml. Builds the macOS slices the parent's
-# resolve job placed in `matrix`: arm64 Metal (P0) and x64 CPU (P0). The Metal
-# shader library is EMBEDDED (-DGGML_METAL_EMBED_LIBRARY=ON) so the bundle needs
-# no default.metallib beside the binary. Each slice pins an explicit
-# -DCMAKE_OSX_DEPLOYMENT_TARGET so the binary declares a loadable floor instead
-# of inheriting the (newer) runner OS. @loader_path rpath resolves any sibling
-# dylib from the binary's own directory. Only whisper-server is built.
+# resolve job placed in `matrix`: arm64 Metal (P0) and x64 CPU (P0). Per-slice
+# knobs (defines / shared / static / deploy_target) come from that matrix:
+#   arm64 Metal: STATIC single-file, Metal shader library EMBEDDED
+#     (-DGGML_METAL_EMBED_LIBRARY=ON, +BF16) so the bundle needs no
+#     default.metallib beside the binary; Apple Silicon is one CPU baseline so a
+#     variant set buys nothing.
+#   x64 CPU: DYNAMIC (GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS) so the x86-64
+#     microarch dispatch matches the Linux/Windows x64 CPU bundles; @loader_path
+#     rpath resolves the co-located dylibs from the binary's own directory.
+# Each slice pins an explicit -DCMAKE_OSX_DEPLOYMENT_TARGET so the binary
+# declares a loadable floor instead of inheriting the (newer) runner OS. Only
+# whisper-server is built.
 
 on:
   workflow_call:
@@ -55,7 +61,7 @@ jobs:
           cmake -B build \
             ${{ matrix.defines }} \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=${{ matrix.shared }} \
             -DGGML_NATIVE=OFF \
             -DWHISPER_BUILD_EXAMPLES=ON \
             -DWHISPER_BUILD_SERVER=ON \
@@ -82,7 +88,7 @@ jobs:
           ARCH: ${{ matrix.build }}
           ACCEL: ${{ matrix.accel }}
           BACKEND: ${{ matrix.backend }}
-          STATIC: "true"
+          STATIC: ${{ matrix.static }}
           MIN_OS: "macos-${{ matrix.deploy_target }}"
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           SRC_DIR: ${{ github.workspace }}/src

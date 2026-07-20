@@ -7,11 +7,22 @@ name: "Unsloth whisper prebuilt: CPU"
 # bundles: Linux x64, Linux arm64, Windows x64/arm64. (The macOS x64 CPU slice
 # is built by the macOS child so it shares the deployment-target logic.)
 #
-# CPU bundles are STATIC (-DBUILD_SHARED_LIBS=OFF): whisper-server links
-# libwhisper/libggml into one self-contained binary, so it is a single-file
-# drop-in that needs no loader changes. GGML_NATIVE=OFF keeps the CPU dispatch
-# portable across microarchitectures. Only the whisper-server target is built
-# (examples on so the server compiles, tests off).
+# Portability model, per arch (mirrors upstream ggml-org/whisper.cpp and
+# unslothai/llama.cpp CPU builds):
+#   x86-64 (Linux x64, Windows x64): DYNAMIC -- GGML_BACKEND_DL +
+#     GGML_CPU_ALL_VARIANTS build every CPU microarch as a loadable ggml backend
+#     module (ggml-cpu-sse42/sandybridge/haswell/skylakex/icelake ...); ggml
+#     probes the host at server startup and dispatches to the best variant it
+#     supports (SSE4.2 .. AVX-512). This is why the bundle ships co-located libs
+#     rather than one file: GGML_NATIVE=OFF alone does NOT lower the ISA floor
+#     (it only drops -march=native), so a single static x86 build would bake in
+#     an AVX2/Haswell-2013 floor and SIGILL on older CPUs. The sidecar already
+#     prepends the binary dir to LD_LIBRARY_PATH/PATH for the co-located libs.
+#   arm64 (Linux arm64): STATIC single-file -- ARM has no x86-style variant set,
+#     so pin the broad armv8-a baseline (GGML_CPU_ARM_ARCH=armv8-a) and ship one
+#     self-contained binary.
+# Only the whisper-server target is built (examples on so the server compiles,
+# tests off).
 
 on:
   workflow_call:
@@ -37,8 +48,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   runner: ubuntu-22.04 }
-          - { arch: arm64, runner: ubuntu-22.04-arm }
+          # x86-64: dynamic, runtime microarch dispatch (see header).
+          - { arch: x64,   runner: ubuntu-22.04,     shared: "ON",  cpu_defines: "-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON", static: "false" }
+          # arm64: static single-file at the broad armv8-a baseline (see header).
+          - { arch: arm64, runner: ubuntu-22.04-arm, shared: "OFF", cpu_defines: "-DGGML_CPU_ARM_ARCH=armv8-a",                     static: "true"  }
     steps:
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@v6
@@ -72,14 +85,14 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2.20
         with: { key: "cpu-linux-${{ matrix.arch }}", variant: ccache, evict-old-files: 14d }
 
-      - name: Configure + build (static, portable CPU dispatch)
+      - name: Configure + build
         working-directory: src
         run: |
           set -eux
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
-            -DGGML_NATIVE=OFF \
+            -DBUILD_SHARED_LIBS=${{ matrix.shared }} \
+            -DGGML_NATIVE=OFF ${{ matrix.cpu_defines }} \
             -DWHISPER_BUILD_EXAMPLES=ON \
             -DWHISPER_BUILD_SERVER=ON \
             -DWHISPER_BUILD_TESTS=OFF \
@@ -97,7 +110,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
           ACCEL: cpu
           BACKEND: cpu
-          STATIC: "true"
+          STATIC: ${{ matrix.static }}
           MIN_OS: "glibc-2.35"
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           SRC_DIR: ${{ github.workspace }}/src
@@ -138,8 +151,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x64,   msvc_arch: amd64,       optional: false }
-          - { arch: arm64, msvc_arch: amd64_arm64, optional: true  }
+          # x86-64: dynamic, runtime microarch dispatch (see header).
+          - { arch: x64,   msvc_arch: amd64,       optional: false, shared: "ON",  cpu_defines: "-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON", static: "false" }
+          # arm64: cross-compiled, best-effort, single static binary.
+          - { arch: arm64, msvc_arch: amd64_arm64, optional: true,  shared: "OFF", cpu_defines: "",                                                 static: "true"  }
     continue-on-error: ${{ matrix.optional }}
     defaults:
       run: { shell: pwsh }
@@ -170,13 +185,13 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with: { arch: "${{ matrix.msvc_arch }}" }
 
-      - name: Configure + build (static, portable CPU dispatch)
+      - name: Configure + build
         working-directory: src
         run: |
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DBUILD_SHARED_LIBS=OFF `
-            -DGGML_NATIVE=OFF `
+            -DBUILD_SHARED_LIBS=${{ matrix.shared }} `
+            -DGGML_NATIVE=OFF ${{ matrix.cpu_defines }} `
             -DWHISPER_BUILD_EXAMPLES=ON `
             -DWHISPER_BUILD_SERVER=ON `
             -DWHISPER_BUILD_TESTS=OFF `
@@ -191,7 +206,7 @@ jobs:
           ARCH: ${{ matrix.arch }}
           ACCEL: cpu
           BACKEND: cpu
-          STATIC: "true"
+          STATIC: ${{ matrix.static }}
           MIN_OS: "windows-10"
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           SRC_DIR: ${{ github.workspace }}/src

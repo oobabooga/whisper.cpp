@@ -16,7 +16,7 @@ them against in-tree pins, and drops `whisper-server` into the managed
 ```
 .github/workflows/
   unsloth-prebuilt.yml            orchestrator: resolve tag -> fan out -> gate -> publish
-  unsloth-prebuilt-cpu.yml        P0  Linux x64/arm64 + Windows x64/arm64 CPU (static)
+  unsloth-prebuilt-cpu.yml        P0  Linux x64/arm64 + Windows x64/arm64 CPU (x86 dynamic, arm64 static)
   unsloth-prebuilt-macos.yml      P0  macOS arm64 Metal + macOS x64 CPU
   unsloth-prebuilt-cuda.yml       P1  Linux CUDA (x64 + arm64, coverage profiles)
   unsloth-prebuilt-cuda-windows.yml P1 Windows x64 CUDA (coverage profiles)
@@ -75,9 +75,17 @@ validate:
 | `whisper-<tag>-macos-x64-cpu.tar.gz` | `macos-15-intel` |
 | `whisper-<tag>-macos-arm64-metal.tar.gz` | `macos-14` |
 
-CPU bundles are **static** (`-DBUILD_SHARED_LIBS=OFF`): single-file drop-ins that
-need no loader changes. macOS Metal embeds the shader library
-(`-DGGML_METAL_EMBED_LIBRARY=ON`).
+x86-64 CPU bundles (Linux x64, Windows x64, macOS x64) are **dynamic**
+(`-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON`): the ggml CPU backend is
+built once per microarch (`ggml-cpu-sse42/sandybridge/haswell/skylakex/icelake
+...`) and ggml dispatches to the best variant the host supports at runtime
+(SSE4.2 .. AVX-512), matching upstream ggml-org/whisper.cpp and
+unslothai/llama.cpp. `GGML_NATIVE=OFF` alone does NOT lower the ISA floor, so a
+single static x86 build would bake in an AVX2/Haswell-2013 floor and SIGILL on
+older CPUs. `arm64` CPU bundles are **static** single-file at the broad `armv8-a`
+baseline (`-DGGML_CPU_ARM_ARCH=armv8-a`). macOS `arm64` is a static single-file
+Metal build that embeds the shader library (`-DGGML_METAL_EMBED_LIBRARY=ON`,
+BF16 on).
 
 `whisper-<tag>-windows-arm64-cpu.zip` also builds in the CPU child, cross-compiled
 on the x64 runner with the MSVC `amd64_arm64` toolset (mirroring
