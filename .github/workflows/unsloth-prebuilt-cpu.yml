@@ -157,8 +157,11 @@ jobs:
           - { arch: x64,   msvc_arch: amd64,       optional: false, shared: "ON",  cpu_defines: "-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON", static: "false" }
           # arm64: cross-compiled with clang via the arm64-windows-llvm toolchain
           # (MSVC cannot link ggml's aarch64 repack kernels); OpenMP off keeps the
-          # static binary self-contained. Best-effort, single static binary.
-          - { arch: arm64, msvc_arch: amd64_arm64, optional: true,  shared: "OFF", cpu_defines: "-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_OPENMP=OFF", static: "true"  }
+          # static binary self-contained. Its cmake flags live in the dedicated
+          # "Configure + build (arm64, cmd)" step below (they must be passed in cmd,
+          # not pwsh -- see that step), so cpu_defines is unused here. Best-effort,
+          # single static binary.
+          - { arch: arm64, msvc_arch: amd64_arm64, optional: true,  shared: "OFF", cpu_defines: "", static: "true"  }
     continue-on-error: ${{ matrix.optional }}
     defaults:
       run: { shell: pwsh }
@@ -189,7 +192,9 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with: { arch: "${{ matrix.msvc_arch }}" }
 
-      - name: Configure + build
+      # x64: native MSVC build in pwsh (the ilammy step above set the amd64 env).
+      - name: Configure + build (x64)
+        if: matrix.arch == 'x64'
         working-directory: src
         run: |
           cmake -S . -B build -G Ninja `
@@ -203,6 +208,35 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           cmake --build build --config Release --target whisper-server
+
+      # arm64: cross-compile with clang via the arm64-windows-llvm toolchain file.
+      # This MUST run in cmd, not pwsh: PowerShell word-splits the unquoted
+      # -DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake argument at the
+      # final dot (passing cmake/arm64-windows-llvm + a stray .cmake), so CMake
+      # cannot find the toolchain file. cmd passes it as one token. This mirrors
+      # unslothai/llama.cpp's windows CPU build, which runs its configure in cmd
+      # for the same reason. The ilammy amd64_arm64 env (PATH/LIB/INCLUDE) set
+      # above is inherited here via GITHUB_ENV/GITHUB_PATH.
+      - name: Configure + build (arm64, cmd)
+        if: matrix.arch == 'arm64'
+        working-directory: src
+        shell: cmd
+        run: |
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DBUILD_SHARED_LIBS=${{ matrix.shared }} ^
+            -DGGML_NATIVE=OFF ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake ^
+            -DGGML_OPENMP=OFF ^
+            -DWHISPER_BUILD_EXAMPLES=ON ^
+            -DWHISPER_BUILD_SERVER=ON ^
+            -DWHISPER_BUILD_TESTS=OFF ^
+            -DWHISPER_SDL2=OFF ^
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          if errorlevel 1 exit /b 1
+          cmake --build build --config Release --target whisper-server
+          if errorlevel 1 exit /b 1
 
       - name: Package bundle
         env:
